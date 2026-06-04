@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.28.0",
+    "numpy>=2.0.0",
+    "onnxruntime>=1.16.1",
     "openai>=2.40.0",
     "requests>=2.32.0",
     "sounddevice>=0.5.1",
@@ -28,3 +30,6 @@ package = true
 
 [tool.setuptools.packages.find]
 include = ["asr", "llm", "tts", "vchat", "vclient"]
+
+[tool.setuptools.package-data]
+vclient = ["models/*.onnx"]

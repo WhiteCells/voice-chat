@@ -44,6 +44,8 @@ class Settings:
     llm_temperature: float
     llm_top_p: float
     llm_thinking_disabled: bool
+    llm_timeout: float
+    llm_connect_timeout: float
     tts_base_url: str
     tts_model: str
     tts_voice: str
@@ -53,6 +55,7 @@ class Settings:
     tts_chunk_size: int
     tts_min_chars: int
     tts_flush_chars: int
+    tts_first_chunk_timeout: float
 
     @property
     def asr_uri(self) -> str:
@@ -72,6 +75,16 @@ class Settings:
         return self.asr_proxy
 
 
+class LockedSender:
+    def __init__(self, ws: Any) -> None:
+        self.ws = ws
+        self.lock = asyncio.Lock()
+
+    async def send(self, message: str | bytes) -> None:
+        async with self.lock:
+            await self.ws.send(message)
+
+
 class AsrSession:
     def __init__(self, settings: Settings, turn_id: int, client_ws: Any) -> None:
         self.settings = settings
@@ -83,6 +96,8 @@ class AsrSession:
         self.final_text = ""
         self.last_text = ""
         self.started_at = time.perf_counter()
+        self.audio_bytes = 0
+        self.audio_chunks = 0
 
     async def __aenter__(self) -> "AsrSession":
         self.ws = await websockets.connect(
@@ -93,6 +108,7 @@ class AsrSession:
         )
         await self.ws.send(json_dumps(self._begin_message()))
         self.receiver = asyncio.create_task(self._receive_asr_messages())
+        print(f"[turn {self.turn_id}] asr_start {self.settings.asr_uri}", flush=True)
         return self
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -106,11 +122,17 @@ class AsrSession:
     async def send_audio(self, chunk: bytes) -> None:
         if not self.ws:
             raise RuntimeError("ASR session is not open")
+        self.audio_bytes += len(chunk)
+        self.audio_chunks += 1
         await self.ws.send(chunk)
 
     async def finish(self) -> str:
         if not self.ws:
             raise RuntimeError("ASR session is not open")
+        print(
+            f"[turn {self.turn_id}] asr_finish chunks={self.audio_chunks} bytes={self.audio_bytes}",
+            flush=True,
+        )
         await self.ws.send(json_dumps({"is_speaking": False}))
         try:
             await asyncio.wait_for(
@@ -118,6 +140,10 @@ class AsrSession:
                 timeout=self.settings.asr_final_timeout,
             )
         except asyncio.TimeoutError:
+            print(
+                f"[turn {self.turn_id}] asr_timeout last_text={self.last_text!r}",
+                flush=True,
+            )
             await send_event(
                 self.client_ws,
                 "asr_timeout",
@@ -159,9 +185,10 @@ class AsrSession:
             is_offline_result = "offline" in mode
             if text and (is_final or is_offline_result):
                 self.final_text = text
-                await send_event(self.client_ws, "asr_final", text=text, asr=payload)
+                print(f"[turn {self.turn_id}] asr_final text={text!r}", flush=True)
+                await send_event(self.client_ws, "asr_final", turn_id=self.turn_id, text=text, asr=payload)
             elif text:
-                await send_event(self.client_ws, "asr_partial", text=text, asr=payload)
+                await send_event(self.client_ws, "asr_partial", turn_id=self.turn_id, text=text, asr=payload)
 
             if is_final or (text and is_offline_result):
                 self.final_seen.set()
@@ -276,6 +303,8 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         choices=(0, 1),
         default=int(env_bool("LLM_THINKING_DISABLED", True)),
     )
+    parser.add_argument("--llm-timeout", type=float, default=env_float("LLM_TIMEOUT", 60.0))
+    parser.add_argument("--llm-connect-timeout", type=float, default=env_float("LLM_CONNECT_TIMEOUT", 10.0))
 
     parser.add_argument("--tts-base-url", default=env_str("TTS_BASE_URL", "http://127.0.0.1:51010"))
     parser.add_argument("--tts-model", default=env_str("TTS_MODEL", "/workspace/model/Qwen3-TTS-12Hz-1.7B-Base"))
@@ -286,6 +315,7 @@ def parse_args(argv: list[str] | None = None) -> Settings:
     parser.add_argument("--tts-chunk-size", type=int, default=env_int("TTS_CHUNK_SIZE", 4096))
     parser.add_argument("--tts-min-chars", type=int, default=env_int("TTS_MIN_CHARS", 12))
     parser.add_argument("--tts-flush-chars", type=int, default=env_int("TTS_FLUSH_CHARS", 48))
+    parser.add_argument("--tts-first-chunk-timeout", type=float, default=env_float("TTS_FIRST_CHUNK_TIMEOUT", 30.0))
     args = parser.parse_args(argv)
 
     if args.port <= 0:
@@ -300,6 +330,10 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         parser.error("--asr-final-timeout must be positive")
     if args.llm_max_tokens <= 0:
         parser.error("--llm-max-tokens must be positive")
+    if args.llm_timeout <= 0:
+        parser.error("--llm-timeout must be positive")
+    if args.llm_connect_timeout <= 0:
+        parser.error("--llm-connect-timeout must be positive")
     if args.tts_sample_rate <= 0:
         parser.error("--tts-sample-rate must be positive")
     if args.tts_chunk_size <= 0:
@@ -308,6 +342,8 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         parser.error("--tts-min-chars must be positive")
     if args.tts_flush_chars < args.tts_min_chars:
         parser.error("--tts-flush-chars must be greater than or equal to --tts-min-chars")
+    if args.tts_first_chunk_timeout <= 0:
+        parser.error("--tts-first-chunk-timeout must be positive")
 
     return Settings(
         host=args.host,
@@ -332,6 +368,8 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         llm_temperature=args.llm_temperature,
         llm_top_p=args.llm_top_p,
         llm_thinking_disabled=bool(args.llm_thinking_disabled),
+        llm_timeout=args.llm_timeout,
+        llm_connect_timeout=args.llm_connect_timeout,
         tts_base_url=args.tts_base_url,
         tts_model=args.tts_model,
         tts_voice=args.tts_voice,
@@ -341,6 +379,7 @@ def parse_args(argv: list[str] | None = None) -> Settings:
         tts_chunk_size=args.tts_chunk_size,
         tts_min_chars=args.tts_min_chars,
         tts_flush_chars=args.tts_flush_chars,
+        tts_first_chunk_timeout=args.tts_first_chunk_timeout,
     )
 
 
@@ -360,11 +399,23 @@ def json_dumps(payload: dict[str, Any]) -> str:
 
 
 async def send_event(ws: Any, event_type: str, **payload: Any) -> None:
-    await ws.send(json_dumps({"type": event_type, **payload}))
+    message = json_dumps({"type": event_type, **payload})
+    if isinstance(ws, LockedSender):
+        await ws.send(message)
+    elif hasattr(ws, "send"):
+        await ws.send(message)
+    else:
+        await ws(message)
 
 
 async def stream_llm_reply(settings: Settings, user_text: str) -> AsyncIterator[str]:
-    client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+    timeout = httpx.Timeout(
+        connect=settings.llm_connect_timeout,
+        read=settings.llm_timeout,
+        write=30.0,
+        pool=10.0,
+    )
+    client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url, timeout=timeout)
     extra_body = {"thinking": {"type": "disabled"}} if settings.llm_thinking_disabled else None
     stream = await client.chat.completions.create(
         model=settings.llm_model,
@@ -410,25 +461,6 @@ async def stream_tts_audio(settings: Settings, text: str) -> AsyncIterator[bytes
                     yield chunk
 
 
-async def speak_text(settings: Settings, ws: Any, text: str) -> None:
-    normalized = text.strip()
-    if not normalized:
-        return
-    await send_event(ws, "tts_start", text=normalized)
-    audio_bytes = 0
-    started_at = time.perf_counter()
-    async for chunk in stream_tts_audio(settings, normalized):
-        audio_bytes += len(chunk)
-        await ws.send(chunk)
-    await send_event(
-        ws,
-        "tts_done",
-        text=normalized,
-        audio_bytes=audio_bytes,
-        elapsed=round(time.perf_counter() - started_at, 3),
-    )
-
-
 def should_flush_tts(buffer: str, settings: Settings) -> bool:
     stripped = buffer.strip()
     if len(stripped) >= settings.tts_flush_chars:
@@ -438,29 +470,66 @@ def should_flush_tts(buffer: str, settings: Settings) -> bool:
     return stripped[-1] in TEXT_FLUSH_PUNCTUATION
 
 
-async def answer_turn(settings: Settings, ws: Any, user_text: str) -> None:
-    await send_event(ws, "llm_start")
+async def answer_turn(settings: Settings, ws: Any, user_text: str, turn_id: int) -> None:
+    await send_event(ws, "llm_start", turn_id=turn_id)
+    print(f"[turn {turn_id}] llm_start text={user_text!r}", flush=True)
     full_reply: list[str] = []
     tts_buffer = ""
 
-    async for delta in stream_llm_reply(settings, user_text):
-        full_reply.append(delta)
-        tts_buffer += delta
-        await send_event(ws, "llm_delta", text=delta)
-        if should_flush_tts(tts_buffer, settings):
-            await speak_text(settings, ws, tts_buffer)
-            tts_buffer = ""
+    try:
+        async for delta in stream_llm_reply(settings, user_text):
+            full_reply.append(delta)
+            tts_buffer += delta
+            await send_event(ws, "llm_delta", text=delta, turn_id=turn_id)
+            if should_flush_tts(tts_buffer, settings):
+                await speak_text_for_turn(settings, ws, tts_buffer, turn_id)
+                tts_buffer = ""
 
-    if tts_buffer.strip():
-        await speak_text(settings, ws, tts_buffer)
+        if tts_buffer.strip():
+            await speak_text_for_turn(settings, ws, tts_buffer, turn_id)
 
-    reply = "".join(full_reply).strip()
-    await send_event(ws, "llm_done", text=reply)
+        reply = "".join(full_reply).strip()
+        await send_event(ws, "llm_done", text=reply, turn_id=turn_id)
+        print(f"[turn {turn_id}] llm_done chars={len(reply)}", flush=True)
+    except asyncio.CancelledError:
+        await send_event(ws, "response_cancelled", turn_id=turn_id)
+        raise
+
+
+async def speak_text_for_turn(settings: Settings, ws: Any, text: str, turn_id: int) -> None:
+    normalized = text.strip()
+    if not normalized:
+        return
+    await send_event(ws, "tts_start", text=normalized, turn_id=turn_id)
+    print(f"[turn {turn_id}] tts_start chars={len(normalized)}", flush=True)
+    audio_bytes = 0
+    started_at = time.perf_counter()
+    iterator = stream_tts_audio(settings, normalized).__aiter__()
+    try:
+        first_chunk = await asyncio.wait_for(iterator.__anext__(), timeout=settings.tts_first_chunk_timeout)
+    except StopAsyncIteration as exc:
+        raise RuntimeError("TTS returned an empty audio stream") from exc
+    audio_bytes += len(first_chunk)
+    await ws.send(first_chunk)
+    async for chunk in iterator:
+        audio_bytes += len(chunk)
+        await ws.send(chunk)
+    elapsed = round(time.perf_counter() - started_at, 3)
+    print(f"[turn {turn_id}] tts_done bytes={audio_bytes} elapsed={elapsed}s", flush=True)
+    await send_event(
+        ws,
+        "tts_done",
+        text=normalized,
+        turn_id=turn_id,
+        audio_bytes=audio_bytes,
+        elapsed=elapsed,
+    )
 
 
 async def handle_client(ws: Any, settings: Settings) -> None:
+    sender = LockedSender(ws)
     await send_event(
-        ws,
+        sender,
         "ready",
         asr_sample_rate=settings.asr_sample_rate,
         tts_sample_rate=settings.tts_sample_rate,
@@ -469,12 +538,53 @@ async def handle_client(ws: Any, settings: Settings) -> None:
     )
 
     asr_session: AsrSession | None = None
+    response_task: asyncio.Task[None] | None = None
+    response_turn_id: int | None = None
     turn_id = 0
+
+    async def cancel_response(reason: str) -> None:
+        nonlocal response_task
+        nonlocal response_turn_id
+        if not response_task or response_task.done():
+            response_task = None
+            response_turn_id = None
+            return
+        cancelled_turn_id = response_turn_id
+        response_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await response_task
+        response_task = None
+        response_turn_id = None
+        print(f"cancelled response turn={cancelled_turn_id} reason={reason}", flush=True)
+
+    def start_response_task(user_text: str, answered_turn_id: int) -> None:
+        nonlocal response_task
+        nonlocal response_turn_id
+
+        async def run() -> None:
+            nonlocal response_task
+            nonlocal response_turn_id
+            try:
+                await answer_turn(settings, sender, user_text, answered_turn_id)
+                await send_event(sender, "turn_done", turn_id=answered_turn_id, text=user_text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[turn {answered_turn_id}] response_error {type(exc).__name__}: {exc}", flush=True)
+                await send_event(sender, "error", turn_id=answered_turn_id, message=f"response failed: {exc}")
+            finally:
+                if asyncio.current_task() is response_task:
+                    response_task = None
+                    response_turn_id = None
+
+        response_turn_id = answered_turn_id
+        response_task = asyncio.create_task(run(), name=f"answer-turn-{answered_turn_id}")
+
     try:
         async for message in ws:
             if isinstance(message, bytes):
                 if not asr_session:
-                    await send_event(ws, "error", message="binary audio received before audio_start")
+                    await send_event(sender, "error", message="binary audio received before audio_start")
                     continue
                 await asr_session.send_audio(message)
                 continue
@@ -482,55 +592,61 @@ async def handle_client(ws: Any, settings: Settings) -> None:
             try:
                 payload = json.loads(message)
             except json.JSONDecodeError:
-                await send_event(ws, "error", message="invalid json control message")
+                await send_event(sender, "error", message="invalid json control message")
                 continue
 
             message_type = payload.get("type")
             if message_type == "audio_start":
+                await cancel_response("new audio_start")
                 if asr_session:
-                    await send_event(ws, "error", message="audio_start received while a turn is active")
+                    await send_event(sender, "error", message="audio_start received while a turn is active")
                     continue
                 turn_id += 1
                 sample_rate = int(payload.get("sample_rate") or settings.asr_sample_rate)
                 if sample_rate != settings.asr_sample_rate:
                     await send_event(
-                        ws,
+                        sender,
                         "warning",
                         message=(
                             f"client sample_rate={sample_rate}, "
                             f"ASR expects {settings.asr_sample_rate}"
                         ),
                     )
-                asr_session = AsrSession(settings, turn_id, ws)
+                asr_session = AsrSession(settings, turn_id, sender)
                 try:
                     await asr_session.__aenter__()
                 except Exception as exc:
                     asr_session = None
                     message = f"ASR connection failed: {settings.asr_uri} ({exc})"
                     print(message, flush=True)
-                    await send_event(ws, "error", message=message)
+                    await send_event(sender, "error", message=message)
                     continue
-                await send_event(ws, "turn_started", turn_id=turn_id)
+                await send_event(sender, "turn_started", turn_id=turn_id)
             elif message_type == "audio_end":
                 if not asr_session:
-                    await send_event(ws, "error", message="audio_end received without audio_start")
+                    await send_event(sender, "error", message="audio_end received without audio_start")
                     continue
                 current_session = asr_session
                 asr_session = None
+                current_turn_id = turn_id
                 user_text = await current_session.finish()
                 await current_session.__aexit__(None, None, None)
+                print(f"[turn {current_turn_id}] user_text={user_text!r}", flush=True)
                 if not user_text:
-                    await send_event(ws, "turn_done", turn_id=turn_id, text="", reply="")
+                    await send_event(sender, "turn_done", turn_id=current_turn_id, text="", reply="")
                     continue
                 if user_text != current_session.final_text:
-                    await send_event(ws, "asr_final", text=user_text)
-                await answer_turn(settings, ws, user_text)
-                await send_event(ws, "turn_done", turn_id=turn_id, text=user_text)
+                    await send_event(sender, "asr_final", turn_id=current_turn_id, text=user_text)
+                await cancel_response("new answer")
+                start_response_task(user_text, current_turn_id)
+            elif message_type == "cancel_response":
+                await cancel_response(str(payload.get("reason") or "client request"))
             elif message_type == "ping":
-                await send_event(ws, "pong")
+                await send_event(sender, "pong")
             else:
-                await send_event(ws, "error", message=f"unsupported message type: {message_type}")
+                await send_event(sender, "error", message=f"unsupported message type: {message_type}")
     finally:
+        await cancel_response("client disconnect")
         if asr_session:
             await asr_session.__aexit__(None, None, None)
 

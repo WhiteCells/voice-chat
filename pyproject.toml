@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-chat-workspace"
+version = "0.1.0"
+description = "Unified uv workspace for ASR, LLM, TTS, vchat, and vclient modules."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.0",
+    "openai>=2.40.0",
+    "requests>=2.32.0",
+    "sounddevice>=0.5.1",
+    "websockets>=12.0",
+]
+
+[project.scripts]
+asr = "asr.main:main"
+llm = "llm.main:main"
+tts = "tts.main:main"
+vchat = "vchat.main:main"
+vclient = "vclient.main:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+include = ["asr", "llm", "tts", "vchat", "vclient"]
